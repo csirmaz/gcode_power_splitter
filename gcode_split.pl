@@ -13,8 +13,9 @@ my $num_parts = $ARGV[1];
 print "Splitting into [$num_parts]\n";
 
 # Config
-my $BREAK_RETRACT = 3;
-my $BREAK_HOP = 10;
+my $BREAK_RETRACT = 3;  # How much to retract between parts
+my $BREAK_HOP = 10;  # How much to Z-hop between parts
+my $PRESENT_Y = 200;  # Y coordinate to "present" the print
 # Config ends
 
 # ----------------------------------------------- input -----------------------------------------------
@@ -384,7 +385,7 @@ G1 Z+$BREAK_HOP F4500
 M82 ; absolute E
 G90 ; absolute XYZ
 ; move to a safe rest position
-G1 X0 Y220
+G1 X0 Y$PRESENT_Y
 M106 S0 ; Turn-off fan
 M104 S0 ; Turn-off hotend
 M140 S0 ; Turn-off bed

@@ -10,6 +10,10 @@ It produces `MYFILE.0.gcode`, `MYFILE.1.gcode` etc. for the parts.
 Its main aim is to produce gcode parts that can be printed separately,
 even allowing powering down the 3D printer between sessions.
 
+It completely replaces the start and end gcode snippets. These are defined
+in `get_begin()` and `get_end()` and may require changes for your printer.
+`get_after_layer()` is added after the 1st layer in a part.
+
 The code was written to split Cura-generated gcode files.
 It relies on `; LAYER` comments to identify layers,
 and only parses gcode commands that are necessary for its function.
