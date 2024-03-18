@@ -14,8 +14,9 @@ print "Splitting into [$num_parts]\n";
 
 # Config
 my $BREAK_RETRACT = 3;  # How much to retract between parts
-my $BREAK_HOP = 10;  # How much to Z-hop between parts
-my $PRESENT_Y = 200;  # Y coordinate to "present" the print
+my $BREAK_HOP = 3;  # How much to Z-hop between parts
+my $PRESENT_Y = 219;  # Y coordinate to "present" the print
+my $MAX_Z = 250;  # maximum height
 # Config ends
 
 # ----------------------------------------------- input -----------------------------------------------
@@ -32,6 +33,7 @@ my $init_nozzle_temp;  # initial nozzle temperature
 my $fan; # current fan state, off|number
 my $layer;  # current layer object
 my $layer_num = 0;  # current layer number
+my $end_code_found;  # Whether the end code block has been found
 
 my $pos_e;  # current extruder position
 my $pos_e_max;  # max extruder position encountered
@@ -98,6 +100,7 @@ while(<FH>) {
     }
     
     if($line =~ /^;[ \-]+end code begin/) {
+        $end_code_found = 1;
         $layer = undef;
         next;
     }
@@ -192,6 +195,9 @@ while(<FH>) {
             if($dir eq "Z") {
                 if($extruder_pos eq "rel") { $pos_z = "rel"; }
                 else { $pos_z = $val; }
+                if($pos_z ne "rel" and $pos_z + $BREAK_HOP >= $MAX_Z) {
+                    die "Z coord ($pos_z) can exceed maximum ($MAX_Z) after hop";
+                }
             }
         }
         
@@ -220,13 +226,13 @@ while(<FH>) {
                 $pos_e = $val;
             }
             if($dir eq "X") {
-                die "logical x used";
+                die "Logical coordinate systems are unsupported (G92)";
             }
             if($dir eq "Y") {
-                die "logical y used";
+                die "Logical coordinate systems are unsupported (G92)";
             }
             if($dir eq "Z") {
-                die "logical z used";
+                die "Logical coordinate systems are unsupported (G92)";
             }
         }
     }
@@ -245,8 +251,9 @@ close(FH);
 
 undef $layer;
 
-die "no layer info" unless $layer_count;
-die "layer num mismatch" unless $layer_num != $layer_count - 1;
+die "Overall layer count not found" unless $layer_count;  # This is not really necessary though
+die "Overall layer count mismatch" unless $layer_num != $layer_count - 1;
+die "End gcode block has not been found" unless $end_code_found;
 
 # -------------------------------------------------------- output -----------------------------------------------
 
@@ -263,9 +270,9 @@ sub get_begin {
     }
     
     my $bedtemp = $layer->{'current_bed'};
-    die "no bed temp" unless defined $bedtemp;
+    die "No bed temp found at layer $layer->{'num'}" unless defined $bedtemp;
     my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
-    die "no noz temp" unless defined $noztemp;
+    die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
     my $curz = $layer->{'current_z'} + $BREAK_HOP;
     my $wipex = $block_num * 3; # x coord of wiping area - separate the wipes for different blocks
     
@@ -274,8 +281,9 @@ sub get_begin {
     #           *      |================   We are here
     #     e           e_max
     #     *            |================   We want to be here
-    my $cur_retract = $layer->{'current_e'} - $layer->{'current_e_max'};
     my $pe = $layer->{'current_e'};
+    die "No E position found  at layer $layer->{'num'}" unless defined $pe;
+    my $cur_retract = $layer->{'current_e'} - $layer->{'current_e_max'};
     
     my $fan = '';
     if(defined $layer->{'current_fan'}) {
@@ -285,9 +293,10 @@ sub get_begin {
     my $px = ($layer->{'has_first_move'} == 1 ? $layer->{'first_x'} : $layer->{'current_x'});
     my $py = ($layer->{'has_first_move'} == 1 ? $layer->{'first_y'} : $layer->{'current_y'});
     my $pz = ($layer->{'has_first_move'} == 1 ? $layer->{'first_z'} : $layer->{'current_z'});
-    die "rel pos" if $px eq 'rel' or $py eq 'rel' or $pz eq 'rel';
-    die "no pos" unless((defined $px) and (defined $py) and (defined $pz));
+    die "Only relative positions found  at layer $layer->{'num'}" if $px eq 'rel' or $py eq 'rel' or $pz eq 'rel';
+    die "No positions found  at layer $layer->{'num'}" unless((defined $px) and (defined $py) and (defined $pz));
     my $pz2 = $pz + $BREAK_HOP; # approach from above (does not need to use $BREAK_HOP)
+    if($pz2 >= $MAX_Z) { die "Z coord ($pz2) excedes maximum ($MAX_Z)"; }
     
     # Lower feed rate to increase adhesion to cold layer of prev block
     my $feedrate = ($block_num == 0 ? '' : "M220 S45 ; Slow Feedrate for first layer\n");
@@ -371,7 +380,7 @@ EOD
 sub get_after_layer {
     my $layer = shift;
     my $noztemp = $layer->{'current_nozzle'}; # Restore after possibly higher value
-    die "no noz temp" unless defined $noztemp;
+    die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
     return "M220 S100 ; Reset Feedrate\nM104 S$noztemp ; nozzle temp\n";
 }
 
