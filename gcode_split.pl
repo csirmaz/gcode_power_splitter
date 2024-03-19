@@ -308,9 +308,9 @@ sub get_begin {
     my $feedrate = ($block_num == 0 ? '' : "M220 S45 ; Slow Feedrate for first layer\n");
     
     my $msg = 
-        "; Rendering begin script for block #$block_num at layer #$layer->{'num'}\n"
-        . "; Bed:$bedtemp Nozzle:$noztemp Fan:$layer->{'current_fan'}\n"
-        . "; X:$px Y:$py Z:$pz E:$pe Retract:$cur_retract\n"
+        "; Rendering begin script for block #$block_num at layer #$layer->{'num'} Inherited Z: $curz\n"
+        . "; Layer starts with Bed:$bedtemp Nozzle:$noztemp Fan:$layer->{'current_fan'}\n"
+        . "; Layer starts at X:$px Y:$py Z:$pz E:$pe Retract:$cur_retract\n"
     ;
     print($msg);
     
@@ -395,8 +395,10 @@ sub get_end {
     my $lyr = shift;
     my $block_num = shift; # Which block we're rendering for
     
+    unless(defined $lyr) { die "No layer object given to get_end() at block $block_num"; }
     my $z = $lyr->{'final_z'};
     unless((defined $z) and ($z ne "rel")) { die "No final Z position at layer $lyr->{'num'}"; }
+    print("  Rendering end script for block $block_num\n  Layer: $lyr->{'num'} of $layer_count Final Z: $z\n");
     $z += $BREAK_HOP;
     if($z > $MAX_Z) {
         die "Cannot achieve hop" unless $block_num == $num_parts - 1;
@@ -421,8 +423,9 @@ M18 S60 ; disable all steppers after 1min
 EOD
 }
 
-my $prev_block = -1;
-my $layer_of_block = 0;
+my $prev_block = -1;  # which block/part the previous layer belongs to
+my $layer_of_block = 0;  # counter
+my $prev_layer;  # previous layer object
 foreach my $lyr (@LAYERS, undef) {
     my $block;
     if(defined $lyr) {
@@ -437,7 +440,7 @@ foreach my $lyr (@LAYERS, undef) {
         if($prev_block >= 0) {
             print("Ending block #$prev_block\n");
             print FH "; ========== end code ========\n";
-            print FH get_end($lyr, $block);
+            print FH get_end($prev_layer, $prev_block);
             close(FH);
         }
         # Start new block
@@ -465,5 +468,6 @@ foreach my $lyr (@LAYERS, undef) {
         }
         $layer_of_block++;
     }
+    $prev_layer = $lyr;
 }
 
