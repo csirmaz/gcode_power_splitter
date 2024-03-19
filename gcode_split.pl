@@ -398,7 +398,7 @@ sub get_end {
     unless(defined $lyr) { die "No layer object given to get_end() at block $block_num"; }
     my $z = $lyr->{'final_z'};
     unless((defined $z) and ($z ne "rel")) { die "No final Z position at layer $lyr->{'num'}"; }
-    print("  Rendering end script for block $block_num\n  Layer: $lyr->{'num'} of $layer_count Final Z: $z\n");
+    print("  Rendering end script for block $block_num\n  Layer #$lyr->{'num'} ($layer_count total) Final Z: $z\n");
     $z += $BREAK_HOP;
     if($z > $MAX_Z) {
         die "Cannot achieve hop" unless $block_num == $num_parts - 1;
