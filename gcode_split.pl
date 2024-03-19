@@ -14,8 +14,8 @@ print "Splitting into [$num_parts]\n";
 
 # Config
 my $BREAK_RETRACT = 3;  # How much to retract between parts
-my $BREAK_HOP = 3;  # How much to Z-hop between parts
-my $PRESENT_Y = 219;  # Y coordinate to "present" the print
+my $BREAK_HOP = 10;  # How much to Z-hop between parts
+my $PRESENT_Y = 220;  # Y coordinate to "present" the print
 my $MAX_Z = 250;  # maximum height
 # Config ends
 
@@ -74,6 +74,13 @@ sub new_layer {
     };
 }
 
+sub record_final {
+    my $lyr = shift;
+    $lyr->{'final_x'} = $pos_x;
+    $lyr->{'final_y'} = $pos_y;
+    $lyr->{'final_z'} = $pos_z;
+}
+
 open(FH, '<', $filename) or die "Cannot open $filename: $!";
 while(<FH>) {
     my $line = $_;
@@ -93,6 +100,7 @@ while(<FH>) {
     if($line =~ /^;LAYER:\s*([0-9]+)\s$/) {
         if($1 != $layer_num) { die "layer number not consecutive at $layer_num"; }
         if($layer_num == 0) { print("Layer 0 here\n"); }
+        if($layer) { record_final($layer); }
         $layer = new_layer();
         push @LAYERS, $layer;
         $layer_num++;
@@ -101,6 +109,7 @@ while(<FH>) {
     
     if($line =~ /^;[ \-]+end code begin/) {
         $end_code_found = 1;
+        if($layer) { record_final($layer); }
         $layer = undef;
         next;
     }
@@ -195,9 +204,6 @@ while(<FH>) {
             if($dir eq "Z") {
                 if($extruder_pos eq "rel") { $pos_z = "rel"; }
                 else { $pos_z = $val; }
-                if($pos_z ne "rel" and $pos_z + $BREAK_HOP >= $MAX_Z) {
-                    die "Z coord ($pos_z) can exceed maximum ($MAX_Z) after hop";
-                }
             }
         }
         
@@ -274,7 +280,7 @@ sub get_begin {
     my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
     die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
     my $curz = $layer->{'current_z'} + $BREAK_HOP;
-    my $wipex = $block_num * 3; # x coord of wiping area - separate the wipes for different blocks
+    my $wipex = $block_num * 2.4; # x coord of wiping area - separate the wipes for different blocks
     
     my $wipe_retract = -0.5;
     #         -0.5     0
@@ -378,23 +384,36 @@ EOD
 
 # This is added after the first layer in a block
 sub get_after_layer {
-    my $layer = shift;
-    my $noztemp = $layer->{'current_nozzle'}; # Restore after possibly higher value
-    die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
+    my $lyr = shift;
+    
+    my $noztemp = $lyr->{'current_nozzle'}; # Restore after possibly higher value
+    die "No nozzle temp found at layer $lyr->{'num'}" unless defined $noztemp;
     return "M220 S100 ; Reset Feedrate\nM104 S$noztemp ; nozzle temp\n";
 }
 
 sub get_end {
+    my $lyr = shift;
+    my $block_num = shift; # Which block we're rendering for
+    
+    my $z = $lyr->{'final_z'};
+    unless((defined $z) and ($z ne "rel")) { die "No final Z position at layer $lyr->{'num'}"; }
+    $z += $BREAK_HOP;
+    if($z > $MAX_Z) {
+        die "Cannot achieve hop" unless $block_num == $num_parts - 1;
+        # Allow smaller hop at the top
+        $z = $MAX_Z; 
+    }
+
     return <<EOD
 G91 ; relative XYZ
 M83 ; relative E
 ; retract filament, move Z slightly upwards
 G1 E-$BREAK_RETRACT F4500
-G1 Z+$BREAK_HOP F4500
 M82 ; absolute E
 G90 ; absolute XYZ
+G0 Z$z F4500
 ; move to a safe rest position
-G1 X0 Y$PRESENT_Y
+G0 X0 Y$PRESENT_Y
 M106 S0 ; Turn-off fan
 M104 S0 ; Turn-off hotend
 M140 S0 ; Turn-off bed
@@ -418,7 +437,7 @@ foreach my $lyr (@LAYERS, undef) {
         if($prev_block >= 0) {
             print("Ending block #$prev_block\n");
             print FH "; ========== end code ========\n";
-            print FH get_end();
+            print FH get_end($lyr, $block);
             close(FH);
         }
         # Start new block
