@@ -79,6 +79,7 @@ sub record_final {
     $lyr->{'final_x'} = $pos_x;
     $lyr->{'final_y'} = $pos_y;
     $lyr->{'final_z'} = $pos_z;
+    $lyr->{'final_nozzle'} = $nozzle_temp;
 }
 
 open(FH, '<', $filename) or die "Cannot open $filename: $!";
@@ -386,7 +387,7 @@ EOD
 sub get_after_layer {
     my $lyr = shift;
     
-    my $noztemp = $lyr->{'current_nozzle'}; # Restore after possibly higher value
+    my $noztemp = $lyr->{'final_nozzle'}; # Restore after possibly higher value
     die "No nozzle temp found at layer $lyr->{'num'}" unless defined $noztemp;
     return "M220 S100 ; Reset Feedrate\nM104 S$noztemp ; nozzle temp\n";
 }
