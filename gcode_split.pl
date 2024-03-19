@@ -12,12 +12,33 @@ my $num_parts = $ARGV[1];
 
 print "Splitting into [$num_parts]\n";
 
-# Config
-my $BREAK_RETRACT = 3;  # How much to retract between parts
-my $BREAK_HOP = 10;  # How much to Z-hop between parts
-my $PRESENT_Y = 220;  # Y coordinate to "present" the print
-my $MAX_Z = 250;  # maximum height
-# Config ends
+# -------------------------- Config ---------------------------------
+# Use 0 and 1 for booleans below
+
+my $BREAK_RETRACT = 3;  # How much to retract between parts (mm)
+my $BREAK_HOP = 10;  # How much to Z-hop between parts (mm)
+my $PRESENT_Y = 220;  # Y coordinate to "present" the print (mm)
+my $MAX_Z = 250;  # maximum height (mm)
+
+# We always wipe/prep the nozzle on the bed in the first part.
+# In subsequent parts we can use "air" prep where the printer extrudes
+# and beeps & pauses so the extrusion could be removed.
+# This avoids bumping into the part if it is wide, but requires intervention. (bool)
+my $USE_AIR_PREP = 1;
+# If using bed prep for all parts, whether to shift them.
+# Without this the prep line needs to be removed manually, but the prep area is larger. (bool)
+my $SHIFT_BED_PREP = 1;
+
+# Whether to retrace the last layer of the previous block when starting a new block
+# to improve adhesion (bool)
+my $DO_IRON = 1;
+
+# Reduce z-height by this amount at every continuation to improve layer adhesion and reduce
+# underextrusion. Ratio of layer height. 0 to off.
+my $Z_COMPRESSION = 0.3;
+
+# Flow rate during the first layer when continuing. To combat underextrusion.
+my $CONT_FLOW_RATE = 120;
 
 # ----------------------------------------------- input -----------------------------------------------
 
@@ -46,12 +67,10 @@ print("READING INPUT\n");
 # These commands are known and we simply ignore them
 my %ignoredo = (
     "" => 1,  # when the line is only a comment
-    "M105" => 1,
-    "M413" => 1,
-    "M420" => 1,
+    "M105" => 1, # report temp
+    "M413" => 1, # power-loss recovery
+    "M420" => 1, # bed levelling state
     "G28" => 1, # home
-    "M220" => 1, # feedrate
-    "M221" => 1, # flowrate
     "M84" => 1, # disable steppers
 );
 
@@ -60,20 +79,23 @@ my @LAYERS;
 # Return a new layer object
 sub new_layer {
     return {
-        'num'=> $layer_num,
-        'current_x'=> $pos_x,  # position at the beginning of the layer
-        'current_y'=> $pos_y,
-        'current_z'=> $pos_z,
-        'current_e'=> $pos_e,
-        'current_e_max'=> $pos_e_max,
-        'current_fan'=> $fan,
-        'current_bed'=> $bed_temp,
-        'current_nozzle'=> $nozzle_temp,
-        'gcode'=> [],  # lines of gcode belonging to the layer
+        'num' => $layer_num,
+        'current_x' => $pos_x,  # position at the beginning of the layer
+        'current_y' => $pos_y,
+        'current_z' => $pos_z,
+        'current_e' => $pos_e,
+        'current_e_max' => $pos_e_max,
+        'current_fan' => $fan,
+        'current_bed' => $bed_temp,
+        'current_nozzle' => $nozzle_temp,
+        'gcode' => [],  # lines of gcode belonging to the layer
         'has_first_move'=> 0,  # see below
+        'ironing_gcode' => [],
+        'can_iron' => 1,
     };
 }
 
+# Record the final state in a layer object
 sub record_final {
     my $lyr = shift;
     $lyr->{'final_x'} = $pos_x;
@@ -133,11 +155,13 @@ while(<FH>) {
         print "* absolute pos\n";
         $extruder_pos = "abs";
         $xyz_pos = "abs";
+        push @{$layer->{'ironing_gcode'}}, $line if $layer;
     }
     elsif($dos[0] eq "G91") {
         print "* relative pos\n";
         $extruder_pos = "rel";
         $xyz_pos = "rel";
+        $layer->{'can_iron'} = 0 if $layer;
     }
     elsif($dos[0] eq "M82") {
         print "* absolute extr\n";
@@ -218,6 +242,15 @@ while(<FH>) {
             }
             $layer->{'has_first_move'} = ($has_e ? 2 : 1);
         }
+        
+        if($layer) {
+            if($extruder_pos eq "rel") {
+                $layer->{'can_iron'} = 0;
+            } else {
+                push @{$layer->{'ironing_gcode'}}, "G0 X$pos_x Y$pos_y Z$pos_z F600 ; ironing" if $layer;
+            }
+        }
+        
     }
     elsif($dos[0] eq "G92") {
         # set position
@@ -243,15 +276,20 @@ while(<FH>) {
             }
         }
     }
-    
+    elsif($dos[0] eq "M220") {
+        # We're not tracking this - reporting only
+        print "> Feedrate: $line";
+    }
+    elsif($dos[0] eq "M221") {
+        # We're not tracking this - reporting only
+        print "> Flowrate: $line";
+    }
     elsif($ignoredo{$dos[0]}) { 1; }
     else {
         die "Unknown command [$dos[0]] [$line]\n";
     }
     
-    if($layer) {
-        push @{$layer->{'gcode'}}, $line;
-    }
+    push @{$layer->{'gcode'}}, $line if $layer;
     
 }
 close(FH);
@@ -267,7 +305,32 @@ die "End gcode block has not been found" unless $end_code_found;
 # Loop through layers and produce output
 print("WRITING OUTPUT FILES\n");
 
+# Create ironing code from a layer
+sub get_ironing_code {
+    my $layer = shift;
+    
+    unless($layer->{'can_iron'}) {
+        print("WARNING: Cannot convert layer #$layer->{'num'} to ironing\n");
+        return '';
+    }
+
+    my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
+    die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
+
+    my @commands = (
+        "; Ironing starts",
+        "M107 ; fan off",
+        "M109 S$noztemp ; wait nozzle temp",
+        "; Ironing layer starts",
+        @{$layer->{'ironing_gcode'}},
+        "; Ironing ends"
+    );
+    
+    return join("\n", @commands);
+}
+
 # We use our own begin and end code blocks
+# Render the begin script for a block
 sub get_begin {
     my $layer = shift;
     my $block_num = shift; # Which block we're rendering for
@@ -280,10 +343,16 @@ sub get_begin {
     die "No bed temp found at layer $layer->{'num'}" unless defined $bedtemp;
     my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
     die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
-    my $curz = $layer->{'current_z'} + $BREAK_HOP;
-    my $wipex = $block_num * 2.4; # x coord of wiping area - separate the wipes for different blocks
     
-    my $wipe_retract = -0.5;
+    die "Could not find layer height" unless defined $layer_height;
+    my $curz = $layer->{'current_z'} + $BREAK_HOP;
+    if($Z_COMPRESSION) {
+        die "Could not find layer height" unless defined $layer_height;
+        $curz += $Z_COMPRESSION * $layer_height * $block_num;
+    }
+    my $wipex = $block_num * ($SHIFT_BED_PREP ? 5 : 0); # x coord of wiping area - separate the wipes for different blocks
+    
+    my $wipe_retract = -1;
     #         -0.5     0
     #           *      |================   We are here
     #     e           e_max
@@ -300,13 +369,23 @@ sub get_begin {
     my $px = ($layer->{'has_first_move'} == 1 ? $layer->{'first_x'} : $layer->{'current_x'});
     my $py = ($layer->{'has_first_move'} == 1 ? $layer->{'first_y'} : $layer->{'current_y'});
     my $pz = ($layer->{'has_first_move'} == 1 ? $layer->{'first_z'} : $layer->{'current_z'});
-    die "Only relative positions found  at layer $layer->{'num'}" if $px eq 'rel' or $py eq 'rel' or $pz eq 'rel';
+    die "Only relative positions found at layer $layer->{'num'}" if $px eq 'rel' or $py eq 'rel' or $pz eq 'rel';
     die "No positions found  at layer $layer->{'num'}" unless((defined $px) and (defined $py) and (defined $pz));
     my $pz2 = $pz + $BREAK_HOP; # approach from above (does not need to use $BREAK_HOP)
     if($pz2 >= $MAX_Z) { die "Z coord ($pz2) excedes maximum ($MAX_Z)"; }
     
     # Lower feed rate to increase adhesion to cold layer of prev block
-    my $feedrate = ($block_num == 0 ? '' : "M220 S45 ; Slow Feedrate for first layer\n");
+    my $feedrate = ($block_num == 0 ? '' : "M220 S75 ; Slow Feedrate for first layer\n");
+    
+    my $flowrate = ($block_num == 0 or $CONT_FLOW_RATE == 100 ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
+    
+    # Go through the last layer to warm layer
+    my $ironing = '';
+    if($block_num > 0 and $DO_IRON) {
+        my $prev_layer = $LAYERS[$layer->{'num'} - 1];
+        die "layer num mismatch for ironing" unless $prev_layer->{'num'} == $layer->{'num'} - 1;
+        $ironing = get_ironing_code($prev_layer);
+    }
     
     my $msg = 
         "; Rendering begin script for block #$block_num at layer #$layer->{'num'} Inherited Z: $curz\n"
@@ -319,14 +398,60 @@ sub get_begin {
     if($layer->{'num'} == 0) {
         # First layer
         $homing = "G28 ; homing\n";
-    }else{
-        # Cannot home Z as it moves to the middle
+    } else {
+        # Cannot home Z as that moves to the middle
+        # Note homing moves Z! So we restore Z first
+        # Homing XY should happen above the print
+        # Knocking XY is easy so best to home
         $homing = <<EOD;
 G92 Z$curz ; set Z without homing
 M211 S0 ; Deactive software endstops
-; Note homing moves Z! So we restore Z first
 G90 ; absolute pos
 G28 X0 Y0 ; homing
+EOD
+    }
+    
+    my $wiping;
+    if($layer->{'num'} == 0 or !$USE_AIR_PREP) {
+        # Wipe on bed
+        $wiping = <<EOD;
+; Wiping on bed
+G0 X$wipex.2 Y10 Z10 F5000.0 ; Move to start position allow space to extrude
+
+M104 S$noztemp ; nozzle temp
+M105 ; report temp
+M109 S$noztemp ; wait nozzle temp
+
+G1 X$wipex.2 Y20 Z0.28 F1500 E0 ; diagonal down; undo end code retract
+G1 X$wipex.2 Y160.0 Z0.28 F1500.0 E15 ;Draw the first line
+G1 X$wipex.4 Y160.0 Z0.28 F5000.0 ;Move to side a little
+G1 X$wipex.4 Y40 Z0.28 F1500.0 E30 ;Draw the second line
+
+G92 E0 ; Reset Extruder pos
+G1 E$wipe_retract F600 ; Retract a bit
+G0 X$wipex.0 Y40 Z0.28 F1000 ; wipe across
+G0 X$wipex.5 Y60 Z0.28 F1000 ; more wipe
+G0 X$wipex.0 Y80 Z0.28 F1000 ; more wipe
+EOD
+    } else {
+        # Wiping in air
+        # We don't go down to the bed in case we bump into the print
+        $wiping = <<EOD;
+; Wiping / extruding in air
+G0 X0 Y0 F5000 ; Move to front corner
+
+M104 S$noztemp ; nozzle temp
+M105 ; report temp
+M109 S$noztemp ; wait nozzle temp
+
+G1 E30 F500 ; undo end code extract and extract more
+M106 ; full fan speed
+G4 S2 ; dwell 4s
+M300 S440 P200 ; beep
+M0 CLEANME ; pause, wait for user (may only pause octoprint)
+M107 ; fan off
+G92 E0 ; Reset Extruder pos
+G1 E$wipe_retract F600 ; Retract a bit
 EOD
     }
     
@@ -334,8 +459,8 @@ EOD
 $msg
     
 M413 S0 ; Power loss off
-M220 S100 ;Reset Feedrate
-M221 S100 ;Reset Flowrate
+M220 S100 ; Reset Feedrate
+M221 S100 ; Reset Flowrate
 
 M140 S$bedtemp ; bed temp
 M105 ; report temp
@@ -351,27 +476,16 @@ G92 E-$BREAK_RETRACT ; Reset Extruder pos
 G0 X0 Y0 ; avoid bumping into the model (if homing didn't move us back)
 G Z10
 
-G1 X$wipex.2 Y10 Z10 F5000.0 ; Move to start position allow space to extrude
-
-M104 S$noztemp ; nozzle temp
-M105 ; report temp
-M109 S$noztemp ; wait nozzle temp
-
-G1 X$wipex.2 Y20 Z0.28 F1500 E0 ; diagonal down; undo end code retract
-G1 X$wipex.2 Y160.0 Z0.28 F1500.0 E15 ;Draw the first line
-G1 X$wipex.4 Y160.0 Z0.28 F5000.0 ;Move to side a little
-G1 X$wipex.4 Y40 Z0.28 F1500.0 E30 ;Draw the second line
-
-G92 E0 ; Reset Extruder pos
-G1 E$wipe_retract F600 ;Retract a bit
-G1 X$wipex.0 Y40 Z0.28 F1000 ; wipe across
-G1 X$wipex.5 Y60 Z0.28 F1000 ; more wipe
-G1 X$wipex.0 Y80 Z0.28 F1000 ; more wipe
+$wiping
 
 ; move to desired place from above
-G0 Z$pz2
-G0 X$px Y$py Z$pz2
-G0 X$px Y$py Z$pz
+M220 S100 ; Reset Feedrate
+G0 Z$pz2 F5000
+G0 X$px Y$py Z$pz2 F5000
+G0 X$px Y$py Z$pz F5000
+
+$ironing
+M220 S100 ; Reset Feedrate
 
 ; Restore E and retraction
 G1 E$cur_retract F1500
@@ -379,6 +493,7 @@ G92 E$pe
 G1 E$pe F1800
 
 $fan ; restore fan
+$flowrate
 $feedrate
 EOD
 }
@@ -389,9 +504,10 @@ sub get_after_layer {
     
     my $noztemp = $lyr->{'final_nozzle'}; # Restore after possibly higher value
     die "No nozzle temp found at layer $lyr->{'num'}" unless defined $noztemp;
-    return "M220 S100 ; Reset Feedrate\nM104 S$noztemp ; nozzle temp\n";
+    return "M220 S100 ; Reset Feedrate\nM221 S100 ; Reset Flowrate\nM104 S$noztemp ; nozzle temp\n";
 }
 
+# Render the end script for a block
 sub get_end {
     my $lyr = shift;
     my $block_num = shift; # Which block we're rendering for
@@ -422,6 +538,7 @@ M106 S0 ; Turn-off fan
 M104 S0 ; Turn-off hotend
 M140 S0 ; Turn-off bed
 M18 S60 ; disable all steppers after 1min
+M300 S440 P200 ; beep
 EOD
 }
 
@@ -473,3 +590,4 @@ foreach my $lyr (@LAYERS, undef) {
     $prev_layer = $lyr;
 }
 
+print("Done!\n");
