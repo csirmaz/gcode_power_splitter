@@ -20,25 +20,32 @@ my $BREAK_HOP = 10;  # How much to Z-hop between parts (mm)
 my $PRESENT_Y = 220;  # Y coordinate to "present" the print (mm)
 my $MAX_Z = 250;  # maximum height (mm)
 
+# The space the print head occupies along the X axis when the nozzle is at 0 (mm)
+my $PRINT_HEAD_X_SIDE = 30;
+
 # We always wipe/prep the nozzle on the bed in the first part.
 # In subsequent parts we can use "air" prep where the printer extrudes
 # and beeps & pauses so the extrusion could be removed.
-# This avoids bumping into the part if it is wide, but requires intervention. (bool)
-my $USE_AIR_PREP = 1;
+# This avoids bumping into the part if it is wide, but requires manual intervention. (bool)
+my $USE_AIR_PREP = 0;
+
 # If using bed prep for all parts, whether to shift them.
-# Without this the prep line needs to be removed manually, but the prep area is larger. (bool)
-my $SHIFT_BED_PREP = 1;
+# Without this the prep line needs to be removed manually after every part, but the prep area is larger. (bool)
+my $SHIFT_BED_PREP = 0;
+
+# Whether to use the initial (higher) nozzle temperature when continuing
+my $USE_INIT_TEMP = 0;
 
 # Whether to retrace the last layer of the previous block when starting a new block
 # to improve adhesion (bool)
-my $DO_IRON = 1;
+my $DO_IRON = 0;
 
 # Reduce z-height by this amount at every continuation to improve layer adhesion and reduce
 # underextrusion. Ratio of layer height. 0 to off.
-my $Z_COMPRESSION = 0.3;
+my $Z_COMPRESSION = 0;
 
-# Flow rate during the first layer when continuing. To combat underextrusion.
-my $CONT_FLOW_RATE = 120;
+# Flow rate during the first layer when continuing. To combat underextrusion. 100 to off.
+my $CONT_FLOW_RATE = 100;
 
 # ----------------------------------------------- input -----------------------------------------------
 
@@ -55,6 +62,7 @@ my $fan; # current fan state, off|number
 my $layer;  # current layer object
 my $layer_num = 0;  # current layer number
 my $end_code_found;  # Whether the end code block has been found
+my $print_min_x;  # The minimum x coordinate of anything printed
 
 my $pos_e;  # current extruder position
 my $pos_e_max;  # max extruder position encountered
@@ -155,7 +163,6 @@ while(<FH>) {
         print "* absolute pos\n";
         $extruder_pos = "abs";
         $xyz_pos = "abs";
-        push @{$layer->{'ironing_gcode'}}, $line if $layer;
     }
     elsif($dos[0] eq "G91") {
         print "* relative pos\n";
@@ -202,7 +209,7 @@ while(<FH>) {
             $c =~ /^(.)(.*)$/;
             my $dir = $1;
             my $val = $2;
-            next if($dir eq "G");
+            next if($dir eq "G"); # skip the command itself
             if($dir eq "E") {
                 $has_e = 1;
                 if($extruder_pos eq "rel") {
@@ -219,8 +226,15 @@ while(<FH>) {
             # WARNING We don't track relative movements because most are absolute
             # and not sure what the position is after a homing
             if($dir eq "X") {
-                if($extruder_pos eq "rel") { $pos_x = "rel"; }
-                else { $pos_x = $val; }
+                if($extruder_pos eq "rel") { 
+                    $pos_x = "rel"; 
+                } else { 
+                    $pos_x = $val; 
+                    # We only want to check this here, otherwise moves without X would use values from earlier, e.g. the init code
+                    if($layer) {
+                        if((!defined $print_min_x) or $print_min_x->[0] > $pos_x) { $print_min_x = [$pos_x, $layer_num, $line]; }
+                    }
+                }
             }
             if($dir eq "Y") {
                 if($extruder_pos eq "rel") { $pos_y = "rel"; }
@@ -250,7 +264,7 @@ while(<FH>) {
                 push @{$layer->{'ironing_gcode'}}, "G0 X$pos_x Y$pos_y Z$pos_z F600 ; ironing" if $layer;
             }
         }
-        
+
     }
     elsif($dos[0] eq "G92") {
         # set position
@@ -289,12 +303,20 @@ while(<FH>) {
         die "Unknown command [$dos[0]] [$line]\n";
     }
     
+    # Debug
+    # print "X:$pos_x Y:$pos_y Z:$pos_z E:$pos_e Em:$pos_e_max Layer:$layer Line:$line";
+    
     push @{$layer->{'gcode'}}, $line if $layer;
     
 }
 close(FH);
 
 undef $layer;
+
+print "Minimum X coord of the print $print_min_x->[0] at layer $print_min_x->[1] line: $print_min_x->[2]\n";
+if((!$USE_AIR_PREP) and $print_min_x->[0] <= $PRINT_HEAD_X_SIDE) {
+    die "The minimum X coordinate of the print is too small to let the print head prep the nozzle on the bed (even without shifting)";
+}
 
 die "Overall layer count not found" unless $layer_count;  # This is not really necessary though
 die "Overall layer count mismatch" unless $layer_num != $layer_count - 1;
@@ -305,6 +327,7 @@ die "End gcode block has not been found" unless $end_code_found;
 # Loop through layers and produce output
 print("WRITING OUTPUT FILES\n");
 
+
 # Create ironing code from a layer
 sub get_ironing_code {
     my $layer = shift;
@@ -314,7 +337,7 @@ sub get_ironing_code {
         return '';
     }
 
-    my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
+    my $noztemp = ($USE_INIT_TEMP ? $init_nozzle_temp : $layer->{'current_nozzle'});
     die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
 
     my @commands = (
@@ -329,6 +352,7 @@ sub get_ironing_code {
     return join("\n", @commands);
 }
 
+
 # We use our own begin and end code blocks
 # Render the begin script for a block
 sub get_begin {
@@ -341,7 +365,7 @@ sub get_begin {
     
     my $bedtemp = $layer->{'current_bed'};
     die "No bed temp found at layer $layer->{'num'}" unless defined $bedtemp;
-    my $noztemp = $init_nozzle_temp; # $layer->{'current_nozzle'}; # We use the higher value for better adhesion
+    my $noztemp = ($USE_INIT_TEMP ? $init_nozzle_temp : $layer->{'current_nozzle'});
     die "No nozzle temp found at layer $layer->{'num'}" unless defined $noztemp;
     
     die "Could not find layer height" unless defined $layer_height;
@@ -375,12 +399,13 @@ sub get_begin {
     if($pz2 >= $MAX_Z) { die "Z coord ($pz2) excedes maximum ($MAX_Z)"; }
     
     # Lower feed rate to increase adhesion to cold layer of prev block
-    my $feedrate = ($block_num == 0 ? '' : "M220 S75 ; Slow Feedrate for first layer\n");
+    my $feedrate = ($block_num == 0 ? '' : "M220 S40 ; Slow Feedrate for first layer\n");
     
-    my $flowrate = ($block_num == 0 or $CONT_FLOW_RATE == 100 ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
+    my $flowrate = (($block_num == 0 || $CONT_FLOW_RATE == 100) ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
     
     # Go through the last layer to warm layer
-    my $ironing = '';
+    # If not needed, use this block to get to the desired location. Otherwise start from higher up to avoid bumping into things
+    my $ironing = "G0 X$px Y$py Z$pz F5000";
     if($block_num > 0 and $DO_IRON) {
         my $prev_layer = $LAYERS[$layer->{'num'} - 1];
         die "layer num mismatch for ironing" unless $prev_layer->{'num'} == $layer->{'num'} - 1;
@@ -482,7 +507,6 @@ $wiping
 M220 S100 ; Reset Feedrate
 G0 Z$pz2 F5000
 G0 X$px Y$py Z$pz2 F5000
-G0 X$px Y$py Z$pz F5000
 
 $ironing
 M220 S100 ; Reset Feedrate
@@ -498,6 +522,7 @@ $feedrate
 EOD
 }
 
+
 # This is added after the first layer in a block
 sub get_after_layer {
     my $lyr = shift;
@@ -506,6 +531,7 @@ sub get_after_layer {
     die "No nozzle temp found at layer $lyr->{'num'}" unless defined $noztemp;
     return "M220 S100 ; Reset Feedrate\nM221 S100 ; Reset Flowrate\nM104 S$noztemp ; nozzle temp\n";
 }
+
 
 # Render the end script for a block
 sub get_end {
@@ -541,6 +567,7 @@ M18 S60 ; disable all steppers after 1min
 M300 S440 P200 ; beep
 EOD
 }
+
 
 my $prev_block = -1;  # which block/part the previous layer belongs to
 my $layer_of_block = 0;  # counter

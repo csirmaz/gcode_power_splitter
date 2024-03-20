@@ -32,6 +32,6 @@ was not designed to process.
 
 - Allow prepping the nozzle in the air in case there is not enough room on the bed (configurable - requires the user to remove the extruded filament)
 
-- Print the first layer slowly and at the initial higher temperature when continuing for better adhesion
+- Print the first layer slowly and (optionally) at the initial higher temperature when continuing for better adhesion
 
 - Optionally retrace (iron) the last printed layer to melt it for better adhesion
