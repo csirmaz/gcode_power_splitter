@@ -4,16 +4,18 @@
 # Usage: $0 filename parts
 
 use strict;
+use POSIX qw(ceil);
 $| = 1;
 
-die "Wrong args" unless @ARGV == 2;
+die "Wrong args" unless @ARGV == 1;
 my $filename = $ARGV[0];
-my $num_parts = $ARGV[1];
-
-print "Splitting into [$num_parts]\n";
 
 # -------------------------- Config ---------------------------------
-# Use 0 and 1 for booleans below
+# Use 0 or 1 for booleans below
+
+my $PARTS = 3;  # The number of parts (blocks) to split into (or more if PART_MAX_LAYERS is set)
+my $PART_MAX_LAYERS = -1;  # The max number of layers in a part (or -1 for any)
+my $START_LAYER = 0;  # The first layer to output (0-indexed)
 
 my $BREAK_RETRACT = 3;  # How much to retract between parts (mm)
 my $BREAK_HOP = 10;  # How much to Z-hop between parts (mm)
@@ -27,7 +29,8 @@ my $PRINT_HEAD_X_SIDE = 30;
 # In subsequent parts we can use "air" prep where the printer extrudes
 # and beeps & pauses so the extrusion could be removed.
 # This avoids bumping into the part if it is wide, but requires manual intervention. (bool)
-my $USE_AIR_PREP = 0;
+# WARNING WITHOUT air prep, the crossbar can also bump into the print at low Y levels!
+my $USE_AIR_PREP = 1;
 
 # If using bed prep for all parts, whether to shift them.
 # Without this the prep line needs to be removed manually after every part, but the prep area is larger. (bool)
@@ -35,6 +38,9 @@ my $SHIFT_BED_PREP = 0;
 
 # Whether to use the initial (higher) nozzle temperature when continuing
 my $USE_INIT_TEMP = 0;
+
+# Whether to reheat the bed on the 2nd etc part
+my $REHEAT_BED = 0;
 
 # Whether to retrace the last layer of the previous block when starting a new block
 # to improve adhesion (bool)
@@ -46,6 +52,16 @@ my $Z_COMPRESSION = 0;
 
 # Flow rate during the first layer when continuing. To combat underextrusion. 100 to off.
 my $CONT_FLOW_RATE = 100;
+
+# ---------------------- emergency recovery -------------------
+
+# G92 Z200 ; set Z without homing
+# M211 S0 ; Deactive software endstops
+# G90 ; absolute pos
+# G0 Z300 ; out of the way!
+# G28 X0 Y0 ; homing
+
+# G91 ; reative pos
 
 # ----------------------------------------------- input -----------------------------------------------
 
@@ -292,11 +308,13 @@ while(<FH>) {
     }
     elsif($dos[0] eq "M220") {
         # We're not tracking this - reporting only
-        print "> Feedrate: $line";
+        # print "> Feedrate: $line";
+        die "Feedrate (M220) in main gcode - some features may not work" if $layer;
     }
     elsif($dos[0] eq "M221") {
         # We're not tracking this - reporting only
-        print "> Flowrate: $line";
+        # print "> Flowrate: $line";
+        die "Flowrate (M221) in main gcode - some features may not work" if $layer;
     }
     elsif($ignoredo{$dos[0]}) { 1; }
     else {
@@ -311,8 +329,6 @@ while(<FH>) {
 }
 close(FH);
 
-undef $layer;
-
 print "Minimum X coord of the print $print_min_x->[0] at layer $print_min_x->[1] line: $print_min_x->[2]\n";
 if((!$USE_AIR_PREP) and $print_min_x->[0] <= $PRINT_HEAD_X_SIDE) {
     die "The minimum X coordinate of the print is too small to let the print head prep the nozzle on the bed (even without shifting)";
@@ -322,11 +338,42 @@ die "Overall layer count not found" unless $layer_count;  # This is not really n
 die "Overall layer count mismatch" unless $layer_num != $layer_count - 1;
 die "End gcode block has not been found" unless $end_code_found;
 
+undef $layer;
+undef $layer_num;
+
 # -------------------------------------------------------- output -----------------------------------------------
 
 # Loop through layers and produce output
 print("WRITING OUTPUT FILES\n");
 
+# Figure out how to split the layers
+# For each layer decide which block to put it in
+# Returns "skip" if layer should not go into a block
+# "part" and "block" are the same thing
+sub layer_to_block {
+    my $layer = shift;
+    
+    my $all_layers = $layer_count - $START_LAYER;
+    my $layers_per_part = $all_layers / $PARTS;
+    if($PART_MAX_LAYERS > 0 and $layers_per_part > $PART_MAX_LAYERS) {
+        # print "    LB: max layers restricts. max_layers=$PART_MAX_LAYERS org_layers/block=$layers_per_part\n";
+        $layers_per_part = $all_layers / ceil($all_layers / $PART_MAX_LAYERS);
+    }
+
+    my $total_parts = ceil(($layer_count - $START_LAYER - 1) / ceil($layers_per_part));
+    # print "    LB: parts=$PARTS layer_count=$layer_count all_layers=$all_layers layers/block=$layers_per_part total_parts=$total_parts\n";
+    if(!defined $layer) { 
+        # print "    LB> final\n";
+        return ("final", $total_parts); 
+    }
+    if($layer->{'num'} < $START_LAYER) { 
+        # print "    LB> layer num=$layer->{'num'} SKIP\n";
+        return ("skip", $total_parts); 
+    }
+    my $myblock = int(($layer->{'num'} - $START_LAYER) / ceil($layers_per_part));
+    # print "    LB> layer num=$layer->{'num'} block=$myblock\n";
+    return ($myblock, $total_parts);
+}
 
 # Create ironing code from a layer
 sub get_ironing_code {
@@ -358,10 +405,6 @@ sub get_ironing_code {
 sub get_begin {
     my $layer = shift;
     my $block_num = shift; # Which block we're rendering for
-    
-    if(($block_num == 0) + ($layer->{'num'} == 0) == 1){
-        die "Block num at layer 0 mismatch";
-    }
     
     my $bedtemp = $layer->{'current_bed'};
     die "No bed temp found at layer $layer->{'num'}" unless defined $bedtemp;
@@ -398,10 +441,27 @@ sub get_begin {
     my $pz2 = $pz + $BREAK_HOP; # approach from above (does not need to use $BREAK_HOP)
     if($pz2 >= $MAX_Z) { die "Z coord ($pz2) excedes maximum ($MAX_Z)"; }
     
+    # ----- bed temp -----
+    
+    my $bedtempcode = '';
+    if($block_num == 0 or $REHEAT_BED) {
+        $bedtempcode = <<EOD;
+M140 S$bedtemp ; bed temp
+M105 ; report temp
+M190 S$bedtemp ; wait bed temp
+EOD
+    }
+    
+    # ----- feedrate -----
+    
     # Lower feed rate to increase adhesion to cold layer of prev block
-    my $feedrate = ($block_num == 0 ? '' : "M220 S40 ; Slow Feedrate for first layer\n");
+    my $feedrate = ($block_num == 0 ? '' : "M220 S35 ; Slow Feedrate for first layer\n");
+    
+    # ----- flowrate -----
     
     my $flowrate = (($block_num == 0 || $CONT_FLOW_RATE == 100) ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
+    
+    # ----- ironing -----
     
     # Go through the last layer to warm layer
     # If not needed, use this block to get to the desired location. Otherwise start from higher up to avoid bumping into things
@@ -412,6 +472,8 @@ sub get_begin {
         $ironing = get_ironing_code($prev_layer);
     }
     
+    # ----- debug msg -----
+    
     my $msg = 
         "; Rendering begin script for block #$block_num at layer #$layer->{'num'} Inherited Z: $curz\n"
         . "; Layer starts with Bed:$bedtemp Nozzle:$noztemp Fan:$layer->{'current_fan'}\n"
@@ -419,8 +481,10 @@ sub get_begin {
     ;
     print($msg);
     
+    # ----- homing -----
+    
     my $homing;
-    if($layer->{'num'} == 0) {
+    if($block_num == 0) {
         # First layer
         $homing = "G28 ; homing\n";
     } else {
@@ -436,8 +500,10 @@ G28 X0 Y0 ; homing
 EOD
     }
     
+    # ----- wiping -----
+    
     my $wiping;
-    if($layer->{'num'} == 0 or !$USE_AIR_PREP) {
+    if($block_num == 0 or !$USE_AIR_PREP) {
         # Wipe on bed
         $wiping = <<EOD;
 ; Wiping on bed
@@ -480,6 +546,8 @@ G1 E$wipe_retract F600 ; Retract a bit
 EOD
     }
     
+    # ----- code -----
+    
     return <<EOD;
 $msg
     
@@ -487,10 +555,7 @@ M413 S0 ; Power loss off
 M220 S100 ; Reset Feedrate
 M221 S100 ; Reset Flowrate
 
-M140 S$bedtemp ; bed temp
-M105 ; report temp
-M190 S$bedtemp ; wait bed temp
-
+$bedtempcode
 $homing
 M420 S1; Enable mesh leveling
 
@@ -537,6 +602,7 @@ sub get_after_layer {
 sub get_end {
     my $lyr = shift;
     my $block_num = shift; # Which block we're rendering for
+    my $total_blocks = shift;
     
     unless(defined $lyr) { die "No layer object given to get_end() at block $block_num"; }
     my $z = $lyr->{'final_z'};
@@ -545,7 +611,7 @@ sub get_end {
     if($z > $MAX_Z) { die "Z pos already higher than MAX_Z"; }
     $z += $BREAK_HOP;
     if($z > $MAX_Z) {
-        die "Cannot achieve hop" unless $block_num == $num_parts - 1;
+        die "Cannot achieve hop" unless $block_num == $total_blocks - 1;
         # Allow smaller hop at the top
         $z = $MAX_Z; 
     }
@@ -573,25 +639,20 @@ my $prev_block = -1;  # which block/part the previous layer belongs to
 my $layer_of_block = 0;  # counter
 my $prev_layer;  # previous layer object
 foreach my $lyr (@LAYERS, undef) {
-    my $block;
-    if(defined $lyr) {
-        $block = int($lyr->{'num'} / $layer_count * $num_parts);
-        if($block >= $num_parts) { $block = $num_parts - 1; }
-    } else {
-        $block = $num_parts;
-    }
+    my ($block, $total_blocks) = layer_to_block($lyr);
+    if($block eq "skip") { next; }
     
     if($block != $prev_block) {
         # End previous block
         if($prev_block >= 0) {
-            print("Ending block #$prev_block\n");
+            print("Ending block #$prev_block ($layer_of_block layers)\n");
             print FH "; ========== end code ========\n";
-            print FH get_end($prev_layer, $prev_block);
+            print FH get_end($prev_layer, $prev_block, $total_blocks);
             close(FH);
         }
         # Start new block
         if(defined $lyr) {
-            print("Starting block #$block\n");
+            print("Starting block #$block ($total_blocks blocks total)\n");
             my $outfile = $filename;
             $outfile =~ s/gcode$//;
             $outfile .= $block.".gcode";
