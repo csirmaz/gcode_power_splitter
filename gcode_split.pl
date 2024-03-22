@@ -406,6 +406,8 @@ sub get_begin {
     my $layer = shift;
     my $block_num = shift; # Which block we're rendering for
     
+    my $abs_start = ($layer->{'num'} == 0); # whether we're at the beginning of the whole printing
+    
     my $bedtemp = $layer->{'current_bed'};
     die "No bed temp found at layer $layer->{'num'}" unless defined $bedtemp;
     my $noztemp = ($USE_INIT_TEMP ? $init_nozzle_temp : $layer->{'current_nozzle'});
@@ -415,8 +417,10 @@ sub get_begin {
     my $curz = $layer->{'current_z'} + $BREAK_HOP;
     if($Z_COMPRESSION) {
         die "Could not find layer height" unless defined $layer_height;
+        die "Incompatible params" if $START_LAYER > 0;  # We don't know how many parts we're skipping
         $curz += $Z_COMPRESSION * $layer_height * $block_num;
     }
+    die "Incompatible params" if $START_LAYER > 0 and $SHIFT_BED_PREP;  # We don't know how many parts we're skipping
     my $wipex = $block_num * ($SHIFT_BED_PREP ? 5 : 0); # x coord of wiping area - separate the wipes for different blocks
     
     my $wipe_retract = -1;
@@ -444,7 +448,7 @@ sub get_begin {
     # ----- bed temp -----
     
     my $bedtempcode = '';
-    if($block_num == 0 or $REHEAT_BED) {
+    if($abs_start or $REHEAT_BED) {
         $bedtempcode = <<EOD;
 M140 S$bedtemp ; bed temp
 M105 ; report temp
@@ -455,18 +459,18 @@ EOD
     # ----- feedrate -----
     
     # Lower feed rate to increase adhesion to cold layer of prev block
-    my $feedrate = ($block_num == 0 ? '' : "M220 S35 ; Slow Feedrate for first layer\n");
+    my $feedrate = ($abs_start ? '' : "M220 S35 ; Slow Feedrate for first layer\n");
     
     # ----- flowrate -----
     
-    my $flowrate = (($block_num == 0 || $CONT_FLOW_RATE == 100) ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
+    my $flowrate = (($abs_start || $CONT_FLOW_RATE == 100) ? '' : "M221 S$CONT_FLOW_RATE ; continuation flow rate\n");
     
     # ----- ironing -----
     
     # Go through the last layer to warm layer
     # If not needed, use this block to get to the desired location. Otherwise start from higher up to avoid bumping into things
     my $ironing = "G0 X$px Y$py Z$pz F5000";
-    if($block_num > 0 and $DO_IRON) {
+    if((!$abs_start) and $DO_IRON) {
         my $prev_layer = $LAYERS[$layer->{'num'} - 1];
         die "layer num mismatch for ironing" unless $prev_layer->{'num'} == $layer->{'num'} - 1;
         $ironing = get_ironing_code($prev_layer);
@@ -484,7 +488,7 @@ EOD
     # ----- homing -----
     
     my $homing;
-    if($block_num == 0) {
+    if($abs_start) {
         # First layer
         $homing = "G28 ; homing\n";
     } else {
@@ -503,7 +507,7 @@ EOD
     # ----- wiping -----
     
     my $wiping;
-    if($block_num == 0 or !$USE_AIR_PREP) {
+    if($abs_start or !$USE_AIR_PREP) {
         # Wipe on bed
         $wiping = <<EOD;
 ; Wiping on bed
