@@ -13,7 +13,7 @@ my $filename = $ARGV[0];
 # -------------------------- Config ---------------------------------
 # Use 0 or 1 for booleans below
 
-my $PARTS = 3;  # The number of parts (blocks) to split into (or more if PART_MAX_LAYERS is set)
+my $PARTS = 4;  # The number of parts (blocks) to split into (or more if PART_MAX_LAYERS is set)
 my $PART_MAX_LAYERS = -1;  # The max number of layers in a part (or -1 for any)
 my $START_LAYER = 0;  # The first layer to output (0-indexed)
 
@@ -79,6 +79,7 @@ my $layer;  # current layer object
 my $layer_num = 0;  # current layer number
 my $end_code_found;  # Whether the end code block has been found
 my $print_min_x;  # The minimum x coordinate of anything printed
+my $print_min_y;
 
 my $pos_e;  # current extruder position
 my $pos_e_max;  # max extruder position encountered
@@ -253,8 +254,15 @@ while(<FH>) {
                 }
             }
             if($dir eq "Y") {
-                if($extruder_pos eq "rel") { $pos_y = "rel"; }
-                else { $pos_y = $val; }
+                if($extruder_pos eq "rel") { 
+                    $pos_y = "rel"; 
+                } else { 
+                    $pos_y = $val; 
+                    # We only want to check this here, otherwise moves without Y would use values from earlier, e.g. the init code
+                    if($layer) {
+                        if((!defined $print_min_y) or $print_min_y->[0] > $pos_y) { $print_min_y = [$pos_y, $layer_num, $line]; }
+                    }
+                }
             }
             if($dir eq "Z") {
                 if($extruder_pos eq "rel") { $pos_z = "rel"; }
@@ -330,6 +338,7 @@ while(<FH>) {
 close(FH);
 
 print "Minimum X coord of the print $print_min_x->[0] at layer $print_min_x->[1] line: $print_min_x->[2]\n";
+print "Minimum Y coord of the print $print_min_y->[0] at layer $print_min_y->[1] line: $print_min_y->[2]\n";
 if((!$USE_AIR_PREP) and $print_min_x->[0] <= $PRINT_HEAD_X_SIDE) {
     die "The minimum X coordinate of the print is too small to let the print head prep the nozzle on the bed (even without shifting)";
 }

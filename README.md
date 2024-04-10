@@ -2,14 +2,15 @@
 
 Split gcode into blocks of layers for 3D printing in multiple stages
 
-Usage: `./gcode_split.pl MYFILE.gcode 3`
-where `3` is the number of parts to split the gcode into.
+Usage: `./gcode_split.pl MYFILE.gcode`
 
 It produces `MYFILE.0.gcode`, `MYFILE.1.gcode` etc. for the parts, which
 are horizontal slices of roughly equal height.
 
 The main aim of this script is to produce gcode parts that can be printed in sessions,
 even allowing powering down the 3D printer between sessions.
+
+Configuration values are set at the beginning of the script.
 
 It completely replaces the start and end gcode snippets. These are defined
 in `get_begin()` and `get_end()` and may require changes for your printer.
