@@ -5,7 +5,7 @@ Split gcode into blocks of layers for 3D printing in multiple stages
 Usage: `./gcode_split.pl MYFILE.gcode`
 
 It produces `MYFILE.0.gcode`, `MYFILE.1.gcode` etc. for the parts, which
-are horizontal slices of roughly equal height.
+are horizontal slices of roughly equal height or of roughly equal printing time.
 
 The main aim of this script is to produce gcode parts that can be printed in sessions,
 even allowing powering down the 3D printer between sessions.
@@ -26,6 +26,8 @@ It makes best effort to throw errors if it encounters gcode it
 was not designed to process.
 
 ## Features
+
+- Track printing time
 
 - Approach the printed part from above when continuing so as not to knock it
 

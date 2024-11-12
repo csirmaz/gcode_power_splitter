@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 # Split Cura-generated gcode into parts
-# Usage: $0 filename parts
+# Usage: $0 filename
 
 use strict;
 use POSIX qw(ceil);
@@ -13,14 +13,15 @@ my $filename = $ARGV[0];
 # -------------------------- Config ---------------------------------
 # Use 0 or 1 for booleans below
 
-my $PARTS = 4;  # The number of parts (blocks) to split into (or more if PART_MAX_LAYERS is set)
-my $PART_MAX_LAYERS = -1;  # The max number of layers in a part (or -1 for any)
-my $START_LAYER = 0;  # The first layer to output (0-indexed)
+my $PARTS = 4;  # The number of parts (blocks) to split into
+my $START_LAYER = 0;  # The first layer to output (0-indexed). Use to generate gcode after manually stopping the print at a layer
+my $SPLIT_MODE = "TIME"; # "HEIGHT" so parts would have roughly equal number of layers; "TIME" so parts would print in roughly equal time
 
 my $BREAK_RETRACT = 3;  # How much to retract between parts (mm)
 my $BREAK_HOP = 10;  # How much to Z-hop between parts (mm)
 my $PRESENT_Y = 220;  # Y coordinate to "present" the print (mm)
 my $MAX_Z = 250;  # maximum height (mm)
+my $MAX_SPEED = 250*60;  # maximum speed (mm/min) used for time calculations
 
 # The space the print head occupies along the X axis when the nozzle is at 0 (mm)
 my $PRINT_HEAD_X_SIDE = 30;
@@ -33,7 +34,7 @@ my $PRINT_HEAD_X_SIDE = 30;
 my $USE_AIR_PREP = 1;
 
 # If using bed prep for all parts, whether to shift them.
-# Without this the prep line needs to be removed manually after every part, but the prep area is larger. (bool)
+# Without this the prep line needs to be removed manually after every part, but the object area is larger. (bool)
 my $SHIFT_BED_PREP = 0;
 
 # Whether to use the initial (higher) nozzle temperature when continuing
@@ -80,6 +81,9 @@ my $layer_num = 0;  # current layer number
 my $end_code_found;  # Whether the end code block has been found
 my $print_min_x;  # The minimum x coordinate of anything printed
 my $print_min_y;
+my $feed_rate = 500;  # The current feed rate unit/min (only used to calculate time, so this is a sensible default)
+my $feed_rate_percent = 100;  # The feed rate modifier (percent) (only used to calculate time, so this is a sensible default)
+my $all_time = 0;  # Total time to print, minutes
 
 my $pos_e;  # current extruder position
 my $pos_e_max;  # max extruder position encountered
@@ -115,8 +119,10 @@ sub new_layer {
         'current_nozzle' => $nozzle_temp,
         'gcode' => [],  # lines of gcode belonging to the layer
         'has_first_move'=> 0,  # see below
-        'ironing_gcode' => [],
-        'can_iron' => 1,
+        'ironing_gcode' => [],  # modified movement commands to trace the layer
+        'can_iron' => 1,  # whether the modified commands are usable (bool)
+        'minutes' => 0,  # time it takes to print layer
+        'starts_at_min' => $all_time,  # printing this layer would start at this many minutes
     };
 }
 
@@ -222,13 +228,16 @@ while(<FH>) {
     elsif($dos[0] eq "G0" or $dos[0] eq "G1") {
         # go
         my $has_e = 0;
+        my $old_pos_x = $pos_x;
+        my $old_pos_y = $pos_y;
+        my $old_pos_z = $pos_z;
         foreach my $c (@dos) {
             $c =~ /^(.)(.*)$/;
             my $dir = $1;
             my $val = $2;
-            next if($dir eq "G"); # skip the command itself
+            next if($dir eq "G"); # skip the command itself ("G0" or "G1")
             if($dir eq "E") {
-                $has_e = 1;
+                $has_e = 1; # "has extrusion"
                 if($extruder_pos eq "rel") {
                     $pos_e = "rel";
                     $pos_e_max = "rel";
@@ -268,6 +277,9 @@ while(<FH>) {
                 if($extruder_pos eq "rel") { $pos_z = "rel"; }
                 else { $pos_z = $val; }
             }
+            if($dir eq "F") {
+                $feed_rate = $val;  # This sets the feed rate for subsequent moves as well
+            }
         }
         
         # A layer often starts with a nonextrusion move. If so we want to initialize a block to the end of that move
@@ -285,7 +297,21 @@ while(<FH>) {
             if($extruder_pos eq "rel") {
                 $layer->{'can_iron'} = 0;
             } else {
+                # Collect all movements in a layer to do ironing (for warming)
                 push @{$layer->{'ironing_gcode'}}, "G0 X$pos_x Y$pos_y Z$pos_z F600 ; ironing" if $layer;
+            }
+            
+            # Collect the time it takes to print this layer
+            if($feed_rate) {
+                my $dx = $pos_x - $old_pos_x;
+                my $dy = $pos_y - $old_pos_y;
+                my $dz = $pos_z - $old_pos_z;
+                my $dist = sqrt($dx*$dx + $dy*$dy + $dz*$dz);
+                my $speed = $feed_rate * $feed_rate_percent / 100;
+                if($speed > $MAX_SPEED) { $speed = $MAX_SPEED; }
+                my $minutes = $dist / $speed;
+                $all_time += $minutes;
+                $layer->{'minutes'} += $minutes;
             }
         }
 
@@ -314,12 +340,14 @@ while(<FH>) {
             }
         }
     }
-    elsif($dos[0] eq "M220") {
+    elsif($dos[0] eq "M220" and $dos[1] =~ /^S([0-9\.]+)$/) {
         # We're not tracking this - reporting only
         # print "> Feedrate: $line";
         die "Feedrate (M220) in main gcode - some features may not work" if $layer;
+        $feed_rate_percent = $1;
+        print "* feed rate percent [$feed_rate_percent]\n";
     }
-    elsif($dos[0] eq "M221") {
+    elsif($dos[0] eq "M221" and $dos[1] =~ /^S([0-9\.]+)$/) {
         # We're not tracking this - reporting only
         # print "> Flowrate: $line";
         die "Flowrate (M221) in main gcode - some features may not work" if $layer;
@@ -337,8 +365,9 @@ while(<FH>) {
 }
 close(FH);
 
-print "Minimum X coord of the print $print_min_x->[0] at layer $print_min_x->[1] line: $print_min_x->[2]\n";
-print "Minimum Y coord of the print $print_min_y->[0] at layer $print_min_y->[1] line: $print_min_y->[2]\n";
+print "Minimum X coord of the print $print_min_x->[0] at layer $print_min_x->[1]\n"; # line: $print_min_x->[2]\n";
+print "Minimum Y coord of the print $print_min_y->[0] at layer $print_min_y->[1]\n"; # line: $print_min_y->[2]\n";
+print "Total time to print ".($all_time/60)." hours\n";
 if((!$USE_AIR_PREP) and $print_min_x->[0] <= $PRINT_HEAD_X_SIDE) {
     die "The minimum X coordinate of the print is too small to let the print head prep the nozzle on the bed (even without shifting)";
 }
@@ -349,6 +378,15 @@ die "End gcode block has not been found" unless $end_code_found;
 
 undef $layer;
 undef $layer_num;
+
+# Print layer timings
+if(0) {
+    my $ix = 0;
+    foreach my $lyr (@LAYERS) {
+        print "  Layer #$ix starts at ".($lyr->{'starts_at_min'}/60)." hours\n";
+        $ix++;
+    }
+}
 
 # -------------------------------------------------------- output -----------------------------------------------
 
@@ -362,26 +400,37 @@ print("WRITING OUTPUT FILES\n");
 sub layer_to_block {
     my $layer = shift;
     
-    my $all_layers = $layer_count - $START_LAYER;
-    my $layers_per_part = $all_layers / $PARTS;
-    if($PART_MAX_LAYERS > 0 and $layers_per_part > $PART_MAX_LAYERS) {
-        # print "    LB: max layers restricts. max_layers=$PART_MAX_LAYERS org_layers/block=$layers_per_part\n";
-        $layers_per_part = $all_layers / ceil($all_layers / $PART_MAX_LAYERS);
-    }
+    if($SPLIT_MODE eq "HEIGHT") {
+        my $all_layers = $layer_count - $START_LAYER;
+        my $layers_per_part = ceil($all_layers / $PARTS);
 
-    my $total_parts = ceil(($layer_count - $START_LAYER - 1) / ceil($layers_per_part));
-    # print "    LB: parts=$PARTS layer_count=$layer_count all_layers=$all_layers layers/block=$layers_per_part total_parts=$total_parts\n";
-    if(!defined $layer) { 
-        # print "    LB> final\n";
-        return ("final", $total_parts); 
+        my $total_parts = int(($layer_count - 1 - $START_LAYER) / $layers_per_part) + 1;
+        if(!defined $layer) { 
+            return ("final", $total_parts); 
+        }
+        if($layer->{'num'} < $START_LAYER) { 
+            return ("skip", $total_parts); 
+        }
+        my $myblock     = int(($layer->{'num'}  - $START_LAYER) / $layers_per_part);
+        return ($myblock, $total_parts);
     }
-    if($layer->{'num'} < $START_LAYER) { 
-        # print "    LB> layer num=$layer->{'num'} SKIP\n";
-        return ("skip", $total_parts); 
+    if($SPLIT_MODE eq "TIME") {
+        my $all_layers = $layer_count - $START_LAYER;
+        my $start_time = $LAYERS[$START_LAYER]->{'starts_at_min'};
+        my $time_per_part = ($all_time - $start_time) / $PARTS + 1;  # add 1 min to ensure we don't overflow
+        
+        my $total_parts = int(($LAYERS[$layer_count-1]->{'starts_at_min'} - $start_time) / $time_per_part) + 1;
+        if(!defined $layer) { 
+            return ("final", $total_parts); 
+        }
+        if($layer->{'num'} < $START_LAYER) { 
+            return ("skip", $total_parts); 
+        }
+        my $myblock     = int(($layer->{'starts_at_min'} - $start_time) / $time_per_part);
+        # print "    Layer #$layer->{'num'} starts at ".($layer->{'starts_at_min'}/60)." hours and goes into block $myblock of $total_parts\n";
+        return ($myblock, $total_parts);
     }
-    my $myblock = int(($layer->{'num'} - $START_LAYER) / ceil($layers_per_part));
-    # print "    LB> layer num=$layer->{'num'} block=$myblock\n";
-    return ($myblock, $total_parts);
+    die "Unknown split mode";
 }
 
 # Create ironing code from a layer
@@ -650,6 +699,7 @@ EOD
 
 my $prev_block = -1;  # which block/part the previous layer belongs to
 my $layer_of_block = 0;  # counter
+my $time_of_block = 0;  # counter
 my $prev_layer;  # previous layer object
 foreach my $lyr (@LAYERS, undef) {
     my ($block, $total_blocks) = layer_to_block($lyr);
@@ -658,7 +708,7 @@ foreach my $lyr (@LAYERS, undef) {
     if($block != $prev_block) {
         # End previous block
         if($prev_block >= 0) {
-            print("Ending block #$prev_block ($layer_of_block layers)\n");
+            print("Ending block #$prev_block ($layer_of_block layers, ".(int($time_of_block/60*10+.5)/10)." hours)\n");
             print FH "; ========== end code ========\n";
             print FH get_end($prev_layer, $prev_block, $total_blocks);
             close(FH);
@@ -675,6 +725,7 @@ foreach my $lyr (@LAYERS, undef) {
             print FH "; =========== start code ends ================\n";
         }
         $layer_of_block = 0;
+        $time_of_block = 0;
         $prev_block = $block;
     }
     # Print layer
@@ -687,6 +738,7 @@ foreach my $lyr (@LAYERS, undef) {
             print FH "; =========== after 1st layer code ends ===========\n";
         }
         $layer_of_block++;
+        $time_of_block += $lyr->{'minutes'};
     }
     $prev_layer = $lyr;
 }
